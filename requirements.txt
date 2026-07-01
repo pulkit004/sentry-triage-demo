@@ -1,0 +1,4 @@
+sentry-sdk[flask]>=2.0
+flask>=3.0
+requests>=2.31
+psycopg2-binary>=2.9
