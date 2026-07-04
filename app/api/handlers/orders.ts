@@ -1,129 +1,207 @@
-import { Request, Response, NextFunction } from "express";
-import axios from "axios";
+import { Request, Response } from 'express';
+import axios, { AxiosError } from 'axios';
 
-interface Order {
-  id: string;
-  customerId: string;
-  items: OrderItem[];
-  total: number;
-  status: "pending" | "confirmed" | "shipped" | "delivered" | "cancelled";
-  createdAt: string;
+const PAYMENT_SERVICE_URL = process.env.PAYMENT_SERVICE_URL || 'http://127.0.0.1:3001';
+const INVENTORY_SERVICE_URL = process.env.INVENTORY_SERVICE_URL || 'http://127.0.0.1:3002';
+
+const axiosInstance = axios.create({
+  timeout: 5000,
+});
+
+function isAxiosError(error: unknown): error is AxiosError {
+  return axios.isAxiosError(error);
 }
 
-interface OrderItem {
-  productId: string;
-  name: string;
-  quantity: number;
-  price: number;
-}
-
-interface PaymentResult {
-  transactionId: string;
-  status: "success" | "failed" | "pending";
-  amount: number;
-}
-
-const PAYMENT_SERVICE_URL =
-  process.env.PAYMENT_SERVICE_URL || "http://payments-service:3001";
-const INVENTORY_SERVICE_URL =
-  process.env.INVENTORY_SERVICE_URL || "http://inventory-service:3002";
-
-function calculateOrderTotal(items: OrderItem[]): number {
-  return items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-}
-
-function validateOrderItems(items: OrderItem[]): string | null {
-  if (!items || items.length === 0) {
-    return "Order must contain at least one item";
-  }
-  for (const item of items) {
-    if (item.quantity <= 0) return `Invalid quantity for ${item.name}`;
-    if (item.price < 0) return `Invalid price for ${item.name}`;
-  }
-  return null;
-}
-
-export async function createOrder(
-  req: Request,
+function handleServiceError(
   res: Response,
-  next: NextFunction
-) {
-  const { customerId, items } = req.body;
-
-  const validationError = validateOrderItems(items);
-  if (validationError) {
-    return res.status(400).json({ error: validationError });
-  }
-
-  const total = calculateOrderTotal(items);
-
-  // BUG: No try/catch around external service calls.
-  // When payment service returns 503, this throws UnhandledPromiseRejection
-  // that crashes the process instead of returning a proper error response.
-  const paymentResponse = await axios.post(`${PAYMENT_SERVICE_URL}/charge`, {
-    customerId,
-    amount: total,
-    currency: "USD",
-    idempotencyKey: `order-${customerId}-${Date.now()}`,
-  });
-
-  const payment: PaymentResult = paymentResponse.data;
-
-  if (payment.status !== "success") {
-    return res.status(402).json({
-      error: "Payment failed",
-      transactionId: payment.transactionId,
-    });
-  }
-
-  // Reserve inventory
-  const inventoryResponse = await axios.post(
-    `${INVENTORY_SERVICE_URL}/reserve`,
-    {
-      items: items.map((item: OrderItem) => ({
-        productId: item.productId,
-        quantity: item.quantity,
-      })),
-      orderId: payment.transactionId,
+  error: unknown,
+  serviceName: string
+): void {
+  if (isAxiosError(error)) {
+    if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.code === 'ECONNRESET') {
+      console.error(`[orders] ${serviceName} unavailable: ${error.message}`);
+      res.status(503).json({
+        error: 'Service Unavailable',
+        message: `${serviceName} is currently unavailable. Please try again later.`,
+      });
+      return;
     }
-  );
 
-  const order: Order = {
-    id: `ord_${Date.now()}`,
-    customerId,
-    items,
-    total,
-    status: "confirmed",
-    createdAt: new Date().toISOString(),
-  };
+    if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+      console.error(`[orders] ${serviceName} request timed out: ${error.message}`);
+      res.status(504).json({
+        error: 'Gateway Timeout',
+        message: `${serviceName} did not respond in time. Please try again later.`,
+      });
+      return;
+    }
 
-  return res.status(201).json({
-    order,
-    payment: {
-      transactionId: payment.transactionId,
-      status: payment.status,
-    },
-    inventory: inventoryResponse.data,
+    if (error.response) {
+      const status = error.response.status;
+      const upstreamMessage =
+        (error.response.data as { message?: string })?.message ||
+        `${serviceName} returned an error.`;
+
+      if (status >= 400 && status < 500) {
+        console.error(`[orders] ${serviceName} client error ${status}: ${upstreamMessage}`);
+        res.status(status).json({
+          error: 'Upstream Client Error',
+          message: upstreamMessage,
+        });
+        return;
+      }
+
+      console.error(`[orders] ${serviceName} server error ${status}: ${upstreamMessage}`);
+      res.status(502).json({
+        error: 'Bad Gateway',
+        message: `${serviceName} encountered an internal error.`,
+      });
+      return;
+    }
+  }
+
+  console.error(`[orders] Unexpected error communicating with ${serviceName}:`, error);
+  res.status(500).json({
+    error: 'Internal Server Error',
+    message: 'An unexpected error occurred while processing your request.',
   });
 }
 
-export async function getOrder(req: Request, res: Response) {
-  const { orderId } = req.params;
-  const response = await axios.get(
-    `${PAYMENT_SERVICE_URL}/orders/${orderId}`
-  );
-  return res.json(response.data);
+export async function createOrder(req: Request, res: Response): Promise<void> {
+  const { customerId, items, paymentDetails } = req.body;
+
+  if (!customerId || !items || !Array.isArray(items) || items.length === 0) {
+    res.status(400).json({ error: 'Bad Request', message: 'customerId and items are required.' });
+    return;
+  }
+
+  if (!paymentDetails) {
+    res.status(400).json({ error: 'Bad Request', message: 'paymentDetails are required.' });
+    return;
+  }
+
+  // Step 1: Reserve inventory
+  let inventoryReservation: { reservationId: string };
+  try {
+    const inventoryResponse = await axiosInstance.post(
+      `${INVENTORY_SERVICE_URL}/reserve`,
+      { items }
+    );
+    inventoryReservation = inventoryResponse.data;
+  } catch (error) {
+    handleServiceError(res, error, 'Inventory Service');
+    return;
+  }
+
+  // Step 2: Process payment
+  let paymentResult: { transactionId: string; status: string };
+  try {
+    const paymentResponse = await axiosInstance.post(
+      `${PAYMENT_SERVICE_URL}/charge`,
+      {
+        customerId,
+        paymentDetails,
+        reservationId: inventoryReservation.reservationId,
+        items,
+      }
+    );
+    paymentResult = paymentResponse.data;
+  } catch (error) {
+    // Attempt to release the inventory reservation before responding
+    try {
+      await axiosInstance.post(`${INVENTORY_SERVICE_URL}/release`, {
+        reservationId: inventoryReservation.reservationId,
+      });
+    } catch (releaseError) {
+      console.error(
+        '[orders] Failed to release inventory reservation after payment failure:',
+        releaseError
+      );
+    }
+
+    handleServiceError(res, error, 'Payment Service');
+    return;
+  }
+
+  if (paymentResult.status !== 'success') {
+    // Release inventory if payment was not successful
+    try {
+      await axiosInstance.post(`${INVENTORY_SERVICE_URL}/release`, {
+        reservationId: inventoryReservation.reservationId,
+      });
+    } catch (releaseError) {
+      console.error(
+        '[orders] Failed to release inventory reservation after unsuccessful payment:',
+        releaseError
+      );
+    }
+
+    res.status(402).json({
+      error: 'Payment Required',
+      message: 'Payment was not successful. Please check your payment details and try again.',
+    });
+    return;
+  }
+
+  res.status(201).json({
+    message: 'Order created successfully.',
+    orderId: `ord_${Date.now()}`,
+    transactionId: paymentResult.transactionId,
+    reservationId: inventoryReservation.reservationId,
+  });
 }
 
-export async function cancelOrder(req: Request, res: Response) {
+export async function getOrderStatus(req: Request, res: Response): Promise<void> {
   const { orderId } = req.params;
-  const refundResponse = await axios.post(
-    `${PAYMENT_SERVICE_URL}/refund`,
-    { orderId }
-  );
-  return res.json({
+
+  if (!orderId) {
+    res.status(400).json({ error: 'Bad Request', message: 'orderId is required.' });
+    return;
+  }
+
+  let paymentStatus: { status: string; transactionId: string };
+  try {
+    const paymentResponse = await axiosInstance.get(
+      `${PAYMENT_SERVICE_URL}/status/${orderId}`
+    );
+    paymentStatus = paymentResponse.data;
+  } catch (error) {
+    handleServiceError(res, error, 'Payment Service');
+    return;
+  }
+
+  res.status(200).json({
     orderId,
-    status: "cancelled",
-    refund: refundResponse.data,
+    paymentStatus: paymentStatus.status,
+    transactionId: paymentStatus.transactionId,
+  });
+}
+
+export async function refundOrder(req: Request, res: Response): Promise<void> {
+  const { orderId } = req.params;
+  const { reason } = req.body;
+
+  if (!orderId) {
+    res.status(400).json({ error: 'Bad Request', message: 'orderId is required.' });
+    return;
+  }
+
+  let refundResult: { refundId: string; status: string };
+  try {
+    const refundResponse = await axiosInstance.post(
+      `${PAYMENT_SERVICE_URL}/refund`,
+      { orderId, reason }
+    );
+    refundResult = refundResponse.data;
+  } catch (error) {
+    handleServiceError(res, error, 'Payment Service');
+    return;
+  }
+
+  res.status(200).json({
+    message: 'Refund processed successfully.',
+    orderId,
+    refundId: refundResult.refundId,
+    status: refundResult.status,
   });
 }
